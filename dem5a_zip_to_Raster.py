@@ -17,22 +17,18 @@ from rasterio.merge import merge
 # ==================================================
 # 設定
 # ==================================================
-tgt_folder = Path(r"D:\ArcGIS_Project\2604_Kumamoto_Hikawa\03_GSI\02_CONV_JGD2011\22_DEM5A")
-out_tif = Path(r"D:\ArcGIS_Project\2604_Kumamoto_Hikawa\03_GSI\04_DEM5A_RASTER\DEM5A_Hikawa.tif")
+tgt_folder = Path(r"D:\ArcGIS_Project\2610_JERA名古屋\01_GSI_DATA\01_DEM5A\01_ORG")
+out_tif = Path(r"D:\ArcGIS_Project\2610_JERA名古屋\01_GSI_DATA\01_DEM5A\02_Tiff\DEM5A_JERA_Nagoya3.tif")
 
-# 切り出し範囲：経度・緯度
-min_lon = 130.6000
-min_lat = 32.5166
-max_lon = 130.7333
-max_lat = 32.6333
+min_lon = 136.7938
+min_lat = 35.0127
+max_lon = 136.903
+max_lat = 35.0833
 
 nodata = -9999.0
 out_crs = "EPSG:6668"   # JGD2011 緯度経度
 
 
-# ==================================================
-# 関数
-# ==================================================
 def get_text(root, tag_end):
     for elem in root.iter():
         if elem.tag.endswith(tag_end):
@@ -56,7 +52,6 @@ def parse_dem_xml(xml_bytes):
     lower = parse_pos(get_text(root, "lowerCorner"))
     upper = parse_pos(get_text(root, "upperCorner"))
 
-    # FG-GMLでは多くの場合 lowerCorner = 緯度 経度
     lat_min, lon_min = lower
     lat_max, lon_max = upper
 
@@ -67,10 +62,7 @@ def parse_dem_xml(xml_bytes):
     ny = high_y - low_y + 1
 
     start_text = get_text(root, "startPoint")
-    if start_text:
-        sx, sy = map(int, start_text.split())
-    else:
-        sx, sy = 0, 0
+    sx, sy = map(int, start_text.split()) if start_text else (0, 0)
 
     tuple_text = get_text(root, "tupleList")
     if tuple_text is None:
@@ -83,51 +75,37 @@ def parse_dem_xml(xml_bytes):
         line = line.strip()
         if not line:
             continue
-
         parts = line.split(",")
-
         try:
             z = float(parts[-1])
         except Exception:
             z = nodata
-
         values.append(z)
 
     start_index = sy * nx + sx
-
     for i, z in enumerate(values):
         idx = start_index + i
         if idx >= nx * ny:
             break
-
         row = idx // nx
         col = idx % nx
-
         arr[row, col] = z
 
-    dx = (lon_max - lon_min) / (nx - 1)
-    dy = (lat_max - lat_min) / (ny - 1)
+    # 3次メッシュを東西225分割、南北150分割（1セルあたり0.2秒）
+    dx = (lon_max - lon_min) / nx
+    dy = (lat_max - lat_min) / ny
 
-    transform = from_origin(
-        lon_min - dx / 2.0,
-        lat_max + dy / 2.0,
-        dx,
-        dy
-    )
-
+    # セル外枠をメッシュ境界に合わせる
+    transform = from_origin(lon_min, lat_max, dx, dy)
     bounds = (lon_min, lat_min, lon_max, lat_max)
 
     return arr, transform, bounds
 
 
-# ==================================================
-# メイン処理
-# ==================================================
 def main():
     clip_bounds = (min_lon, min_lat, max_lon, max_lat)
 
     zip_paths = sorted(tgt_folder.glob("*.zip"))
-
     if not zip_paths:
         raise RuntimeError(f"ZIPファイルが見つかりません: {tgt_folder}")
 
@@ -138,30 +116,20 @@ def main():
         tile_paths = []
 
         for zip_idx, zip_path in enumerate(zip_paths, start=1):
-            print(f"\n[ZIP] {zip_idx}/{len(zip_paths)} {zip_path.name}")
-
             with zipfile.ZipFile(zip_path, "r") as zf:
-                xml_names = [
-                    n for n in zf.namelist()
-                    if n.lower().endswith(".xml")
-                ]
+                xml_names = [n for n in zf.namelist() if n.lower().endswith(".xml")]
 
-                print(f"  XML files: {len(xml_names)}")
-
-                for xml_idx, name in enumerate(xml_names, start=1):
+                for name in xml_names:
                     xml_bytes = zf.read(name)
-
                     parsed = parse_dem_xml(xml_bytes)
                     if parsed is None:
                         continue
 
                     arr, transform, bounds = parsed
-
                     if not intersects(bounds, clip_bounds):
                         continue
 
                     tmp_tif = tmpdir / f"tile_{len(tile_paths):05d}.tif"
-
                     with rasterio.open(
                         tmp_tif,
                         "w",
@@ -179,27 +147,22 @@ def main():
 
                     tile_paths.append(tmp_tif)
 
-                    print(f"  [PICK] {xml_idx}/{len(xml_names)} {name}")
-
         if not tile_paths:
             raise RuntimeError("指定範囲に交差するXMLが見つかりませんでした。")
 
-        print(f"\n[INFO] picked tiles: {len(tile_paths)}")
+        print(f"[INFO] picked tiles: {len(tile_paths)}")
 
         srcs = [rasterio.open(p) for p in tile_paths]
 
-        mosaic, out_transform = merge(
-            srcs,
-            bounds=clip_bounds,
-            nodata=nodata
-        )
+        # 1. 元タイルの格子位置を崩さないよう bounds を指定せずにモザイク結合
+        mosaic, mosaic_transform = merge(srcs, nodata=nodata)
 
         meta = srcs[0].meta.copy()
         meta.update({
             "driver": "GTiff",
             "height": mosaic.shape[1],
             "width": mosaic.shape[2],
-            "transform": out_transform,
+            "transform": mosaic_transform,
             "crs": out_crs,
             "nodata": nodata,
             "compress": "lzw",
@@ -208,8 +171,10 @@ def main():
 
         out_tif.parent.mkdir(parents=True, exist_ok=True)
 
+        # 2. AREA_OR_POINT を指定して保存（ArcGISに格子点データであることを伝達）
         with rasterio.open(out_tif, "w", **meta) as dst:
             dst.write(mosaic)
+            dst.update_tags(AREA_OR_POINT="Point")
 
         for src in srcs:
             src.close()
